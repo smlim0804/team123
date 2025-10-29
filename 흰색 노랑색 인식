@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+import rospy, cv2, numpy as np
+from sensor_msgs.msg import Image
+from std_msgs.msg import Float32
+from cv_bridge import CvBridge
+
+class LaneDetector:
+    def __init__(self):
+        rospy.init_node("lane_detector", anonymous=True)
+        self.br = CvBridge()
+        # 파라미터(필요하면 rosparam으로 바꿔도 됨)
+        self.topic      = rospy.get_param("~image", "/camera/rgb/image_raw")
+        self.show       = rospy.get_param("~show", False)   # GUI 필요 없으면 False
+        self.roi_top    = rospy.get_param("~roi_top", 0.60) # ROI 윗선 높이 비율
+        self.canny_lo   = rospy.get_param("~canny_lo", 50)
+        self.canny_hi   = rospy.get_param("~canny_hi", 150)
+
+        # 구독/발행
+        rospy.Subscriber(self.topic, Image, self.cb, queue_size=1, buff_size=2**20)
+        self.pub_dbg  = rospy.Publisher("/lane/debug_image", Image, queue_size=1)
+        self.pub_mask = rospy.Publisher("/lane/mask_image", Image, queue_size=1)
+        self.pub_cte  = rospy.Publisher("/lane/center_offset", Float32, queue_size=1)
+        self.pub_yaw  = rospy.Publisher("/lane/heading", Float32, queue_size=1)
+
+        if self.show:
+            cv2.namedWindow("mask", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("overlay", cv2.WINDOW_NORMAL)
+
+    # --- 흰/노랑 마스크 (OpenCV HLS: H[0..179], L[0..255], S[0..255]) ---
+    def color_mask(self, bgr):
+        hls = cv2.cvtColor(bgr, cv2.COLOR_BGR2HLS)
+
+        # 노랑: H≈[15, 35], S 높음, L 중간 이상
+        yellow_lo = np.array([15,  50,  80], dtype=np.uint8)
+        yellow_hi = np.array([35, 255, 255], dtype=np.uint8)
+        mask_y = cv2.inRange(hls, yellow_lo, yellow_hi)
+
+        # 흰색: L 높음(밝기), S 낮음(채도 낮음), H는 무시
+        white_lo = np.array([0,  200,   0], dtype=np.uint8)
+        white_hi = np.array([180, 255,  80], dtype=np.uint8)
+        mask_w = cv2.inRange(hls, white_lo, white_hi)
+
+        mask = cv2.bitwise_or(mask_y, mask_w)
+
+        # 노이즈 제거(열림) + 끊김 보정(닫힘)
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+        return mask
+
+    def cb(self, msg):
+        img = self.br.imgmsg_to_cv2(msg, "bgr8")
+        h, w = img.shape[:2]
+
+        # 1) 색 마스크
+        mask = self.color_mask(img)
+
+        # 2) ROI (하단 사다리꼴)
+        poly = np.array([[
+            (0,   int(0.95*h)), (w,   int(0.95*h)),
+            (int(0.60*w), int(self.roi_top*h)),
+            (int(0.40*w), int(self.roi_top*h))
+        ]], dtype=np.int32)
+        roi_mask = np.zeros_like(mask)
+        cv2.fillPoly(roi_mask, poly, 255)
+        mask = cv2.bitwise_and(mask, roi_mask)
+
+        # 3) 에지 & 허프
+        edges = cv2.Canny(mask, self.canny_lo, self.canny_hi)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180,
+                                threshold=50,
+                                minLineLength=int(0.05*w),
+                                maxLineGap=int(0.02*w))
+
+        # 4) 좌/우 선분 분리 & 피팅
+        overlay = img.copy()
+        left_pts, right_pts = [], []
+        if lines is not None:
+            for x1,y1,x2,y2 in lines[:,0]:
+                if x2 == x1:
+                    continue
+                slope = (y2-y1)/float(x2-x1)
+                if slope < -0.3:
+                    left_pts  += [(x1,y1),(x2,y2)]
+                elif slope >  0.3:
+                    right_pts += [(x1,y1),(x2,y2)]
+                cv2.line(overlay,(x1,y1),(x2,y2),(0,255,0),2)
+
+        def fit_line(points, color):
+            if len(points) >= 2:
+                xs = np.array([p[0] for p in points])
+                ys = np.array([p[1] for p in points])
+                m, b = np.polyfit(xs, ys, 1)  # y = m x + b
+                yb, yt = h-1, int(self.roi_top*h)
+                xb = int((yb - b) / (m + 1e-6))
+                xt = int((yt - b) / (m + 1e-6))
+                cv2.line(overlay, (xb,yb), (xt,yt), color, 6)
+                return (xb, yb), (xt, yt), m, b
+            return None
+
+        L = fit_line(left_pts,  (255,0,0))
+        R = fit_line(right_pts, (0,0,255))
+
+        # 5) 중앙선/오프셋/헤딩 계산
+        cte = 0.0
+        yaw = 0.0
+        if L and R:
+            # 바닥(y=h-1)에서 좌/우 x 좌표 평균을 차선 중앙으로
+            xbL, xbR = L[0][0], R[0][0]
+            center_lane_x = (xbL + xbR) // 2
+            car_center_x  = w // 2
+            cte = float(center_lane_x - car_center_x) / (w/2.0)  # [-1..1] 정규화
+
+            # 상단점 평균으로 헤딩 근사
+            xtL, xtR = L[1][0], R[1][0]
+            center_top_x = (xtL + xtR) // 2
+            yaw = np.arctan2((center_lane_x - center_top_x), (h - int(self.roi_top*h)))
+            # 시각화
+            cv2.line(overlay, (center_lane_x, h-1), (center_top_x, int(self.roi_top*h)), (0,255,255), 4)
+        elif L or R:
+            # 하나만 보일 때는 그 선의 기울기 방향으로 보정(보수적)
+            lane = L if L else R
+            xb = lane[0][0]
+            center_lane_x = xb
+            car_center_x  = w // 2
+            cte = float(center_lane_x - car_center_x) / (w/2.0)
+
+        # 발행
+        self.pub_mask.publish(self.br.cv2_to_imgmsg(mask, encoding="mono8"))
+        self.pub_dbg.publish(self.br.cv2_to_imgmsg(overlay, encoding="bgr8"))
+        self.pub_cte.publish(Float32(data=float(cte)))
+        self.pub_yaw.publish(Float32(data=float(yaw)))
+
+        if self.show:
+            cv2.imshow("mask", mask)
+            cv2.imshow("overlay", overlay)
+            cv2.waitKey(1)
+
+if __name__ == "__main__":
+    LaneDetector()
+    rospy.spin()
